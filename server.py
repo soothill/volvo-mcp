@@ -12,6 +12,8 @@ from mcp.server.mcpserver import MCPServer
 OAUTH_TOKEN_URL = "https://volvoid.eu.volvocars.com/as/token.oauth2"
 OAUTH_AUTH_URL = "https://volvoid.eu.volvocars.com/as/authorization.oauth2"
 CLIENT_ID = "h4Yf0b"
+# Public app client secret embedded in Volvo's official mobile app (same value used by Dielee/volvo2mqtt)
+CLIENT_SECRET = _env("VOLVO_CLIENT_SECRET", "U8YkSbVl6xwsg5YQqZfrgVmIaDphOsy1PCaUsicQto3TR5kwaJse4AZdgfIfcLyw")
 UA = "vca-android/3.12.0"
 SCOPE = ("openid email profile care_by_volvo:financial_information:invoice:read "
          "care_by_volvo:financial_information:payment_method care_by_volvo:subscription:read "
@@ -143,7 +145,7 @@ class VolvoClient:
             raise RuntimeError("VOLVO_USERNAME / VOLVO_PASSWORD not configured")
         s = requests.Session()
         s.headers.update({
-            "authorization": "Basic " + base64.b64encode((CLIENT_ID + ":").encode()).decode(),
+            "authorization": "Basic " + base64.b64encode((CLIENT_ID + ":" + CLIENT_SECRET).encode()).decode(),
             "user-agent": UA,
             "Content-Type": "application/json; charset=utf-8",
         })
@@ -199,7 +201,7 @@ class VolvoClient:
         code = data["authorizeResponse"]["code"]
         s.headers.update({"content-type": "application/x-www-form-urlencoded"})
         r = s.post(OAUTH_TOKEN_URL, data={"code": code, "grant_type": "authorization_code"},
-                   headers={"authorization": "Basic " + base64.b64encode((CLIENT_ID + ":").encode()).decode()},
+                   headers={"authorization": "Basic " + base64.b64encode((CLIENT_ID + ":" + CLIENT_SECRET).encode()).decode()},
                    timeout=20)
         if r.status_code != 200:
             raise RuntimeError("token exchange failed: %s" % r.text)
@@ -210,7 +212,7 @@ class VolvoClient:
             raise RuntimeError("Not authenticated. Use volvo_auth_start/volvo_auth_otp.")
         r = requests.post(OAUTH_TOKEN_URL,
                           data={"grant_type": "refresh_token", "refresh_token": self.refresh_token},
-                          headers={"authorization": "Basic " + base64.b64encode((CLIENT_ID + ":").encode()).decode(),
+                          headers={"authorization": "Basic " + base64.b64encode((CLIENT_ID + ":" + CLIENT_SECRET).encode()).decode(),
                                    "Content-Type": "application/x-www-form-urlencoded"},
                           timeout=20)
         if r.status_code != 200:
