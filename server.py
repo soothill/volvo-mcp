@@ -147,7 +147,7 @@ class VolvoClient:
             raise RuntimeError("VOLVO_USERNAME / VOLVO_PASSWORD not configured")
         s = requests.Session()
         s.headers.update({
-            "authorization": "Basic " + base64.b64encode((CLIENT_ID + ":" + CLIENT_SECRET).encode()).decode(),
+            "authorization": "Basic " + CLIENT_BASIC,
             "user-agent": UA,
             "Content-Type": "application/json; charset=utf-8",
         })
@@ -203,7 +203,7 @@ class VolvoClient:
         code = data["authorizeResponse"]["code"]
         s.headers.update({"content-type": "application/x-www-form-urlencoded"})
         r = s.post(OAUTH_TOKEN_URL, data={"code": code, "grant_type": "authorization_code"},
-                   headers={"authorization": "Basic " + base64.b64encode((CLIENT_ID + ":" + CLIENT_SECRET).encode()).decode()},
+                   headers={"authorization": "Basic " + CLIENT_BASIC},
                    timeout=20)
         if r.status_code != 200:
             raise RuntimeError("token exchange failed: %s" % r.text)
@@ -214,7 +214,7 @@ class VolvoClient:
             raise RuntimeError("Not authenticated. Use volvo_auth_start/volvo_auth_otp.")
         r = requests.post(OAUTH_TOKEN_URL,
                           data={"grant_type": "refresh_token", "refresh_token": self.refresh_token},
-                          headers={"authorization": "Basic " + base64.b64encode((CLIENT_ID + ":" + CLIENT_SECRET).encode()).decode(),
+                          headers={"authorization": "Basic " + CLIENT_BASIC,
                                    "Content-Type": "application/x-www-form-urlencoded"},
                           timeout=20)
         if r.status_code != 200:
@@ -262,17 +262,27 @@ class VolvoClient:
 
 
 def flatten(data):
-    """connected-vehicle v2 payloads: {"data":[{"group":..,"attributes":[{"id","value"}]}]}"""
+    """Volvo API payloads:
+    - {"data": {"name": {"value": v, "unit": u}, ...}}  (connected-vehicle v2)
+    - {"name": {"value": v, ...}, ...}                   (energy v2 state)
+    - {"data": [{"group": g, "attributes": [{"id","value"}]}]} (legacy)
+    """
     out = {}
-    for grp in data.get("data", []):
-        gname = grp.get("group") or grp.get("id") or ""
-        for attr in grp.get("attributes", []):
-            key = attr.get("id")
-            if gname and gname != key:
-                key = "%s.%s" % (gname, key)
-            out[key] = attr.get("value")
-    if "data" in out or not out:  # energy/state style: {"status": {...}}
-        pass
+    payload = data.get("data", data) if isinstance(data, dict) else {}
+    if isinstance(payload, dict):
+        for key, val in payload.items():
+            if isinstance(val, dict) and "value" in val:
+                out[key] = val["value"]
+            else:
+                out[key] = val
+    elif isinstance(payload, list):
+        for grp in payload:
+            gname = grp.get("group") or grp.get("id") or ""
+            for attr in grp.get("attributes", []):
+                k = attr.get("id")
+                if gname and gname != k:
+                    k = "%s.%s" % (gname, k)
+                out[k] = attr.get("value")
     return out
 
 
@@ -319,9 +329,10 @@ async def volvo_status():
             out["battery_percent"] = soc
             v, u = _dist(rng)
             out["electric_range"] = {"value": v, "unit": u}
-            out["charging_connection_status"] = flat_get(e, "chargingConnectionStatus", "charging_connection_status")
-            out["charging_system_status"] = flat_get(e, "chargingSystemStatus", "charging_system_status")
-            out["time_to_full_charge_min"] = flat_get(e, "timeToFullCharge", "estimated_charging_time", "time_to_full_charge")
+            out["charging_connection_status"] = flat_get(e, "chargerConnectionStatus", "chargingConnectionStatus")
+            out["charging_system_status"] = flat_get(e, "chargingStatus", "chargingSystemStatus")
+            out["charging_type"] = flat_get(e, "chargingType")
+            out["time_to_full_charge_min"] = flat_get(e, "timeToFullCharge", "estimated_charging_time")
         except Exception as ex:
             out["energy_error"] = str(ex)
         for name, url in (("doors", DOORS), ("windows", WINDOWS), ("tyres", TYRES)):
@@ -330,7 +341,9 @@ async def volvo_status():
             except Exception as ex:
                 out[name + "_error"] = str(ex)
         try:
-            out["odometer"] = dict(zip(("value", "unit"), _dist(flat_get(flatten(client.get(ODOMETER.format(vin=vin))), "odometer", "value"))))
+            od = flatten(client.get(ODOMETER.format(vin=vin)))
+            v, u = _dist(od.get("odometer"))
+            out["odometer"] = {"value": v, "unit": u}
         except Exception as ex:
             out["odometer_error"] = str(ex)
         try:
