@@ -12,8 +12,6 @@ from mcp.server.mcpserver import MCPServer
 OAUTH_TOKEN_URL = "https://volvoid.eu.volvocars.com/as/token.oauth2"
 OAUTH_AUTH_URL = "https://volvoid.eu.volvocars.com/as/authorization.oauth2"
 CLIENT_ID = "h4Yf0b"
-# Public app client secret embedded in Volvo's official mobile app (same value used by Dielee/volvo2mqtt)
-CLIENT_SECRET = _env("VOLVO_CLIENT_SECRET", "U8YkSbVl6xwsg5YQqZfrgVmIaDphOsy1PCaUsicQto3TR5kwaJse4AZdgfIfcLyw")
 UA = "vca-android/3.12.0"
 SCOPE = ("openid email profile care_by_volvo:financial_information:invoice:read "
          "care_by_volvo:financial_information:payment_method care_by_volvo:subscription:read "
@@ -49,6 +47,9 @@ KM_TO_MI = 0.621371
 
 def _env(name, default=None):
     return os.environ.get(name, default)
+
+# Public app client secret embedded in Volvo's official mobile app (same value used by Dielee/volvo2mqtt)
+CLIENT_SECRET = _env("VOLVO_CLIENT_SECRET", "U8YkSbVl6xwsg5YQqZfrgVmIaDphOsy1PCaUsicQto3TR5kwaJse4AZdgfIfcLyw")
 
 
 def _secret(name, filename):
