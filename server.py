@@ -261,9 +261,9 @@ class VolvoClient:
                     raise RuntimeError("could not parse login form")
                 fields.update({"username": self.username, "password": self.password})
                 r = s.post(action, data=fields, timeout=30, allow_redirects=False)
-                nxt = r.headers.get("location")
-                kind2, payload2, page_url2 = self._follow(
-                    s, urllib.parse.urljoin(action, nxt) if nxt else action)
+                cls = self._classify(r, action)
+                kind2, payload2, page_url2 = cls if cls else self._follow(
+                    s, urllib.parse.urljoin(action, r.headers.get("location") or action))
                 if kind2 == "code":
                     return self._exchange(payload2)
                 if kind2 == "form":
@@ -294,6 +294,27 @@ class VolvoClient:
     BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15")
 
+    def _classify(self, r, url):
+        """Decide what a Keycloak response is: code redirect, form, or OTP page."""
+        loc = r.headers.get("location", "")
+        if loc.startswith("vca://"):
+            return ("code", loc, None)
+        if r.status_code == 200:
+            if 'id="kc-form-login"' in r.text:
+                return ("form", r.text, url)
+            if 'id="kc-otp-login-form"' in r.text or 'name="otp"' in r.text:
+                return ("otp", r.text, url)
+            if "const kcContext" in r.text:
+                # Keycloak 20+ React theme: no <form> in the HTML, the
+                # client renders it from kcContext and POSTs to
+                # url.loginAction. pageId says which form.
+                pid = re.search(r'"pageId"\s*:\s*"([^"]+)"', r.text)
+                pid = (pid.group(1) if pid else "").lower()
+                if "otp" in pid:
+                    return ("otp", r.text, url)
+                return ("form", r.text, url)
+        return None
+
     def _follow(self, s, url):
         """Walk the redirect chain without a browser.
 
@@ -303,26 +324,13 @@ class VolvoClient:
         """
         for _ in range(10):
             r = s.get(url, timeout=30, allow_redirects=False)
+            kind = self._classify(r, url)
+            if kind:
+                return kind
             loc = r.headers.get("location", "")
-            if loc.startswith("vca://"):
-                return ("code", loc, None)
             if r.status_code in (301, 302, 303, 307, 308) and loc:
                 url = urllib.parse.urljoin(url, loc)
                 continue
-            if r.status_code == 200:
-                if 'id="kc-form-login"' in r.text:
-                    return ("form", r.text, url)
-                if 'id="kc-otp-login-form"' in r.text or 'name="otp"' in r.text:
-                    return ("otp", r.text, url)
-                if "const kcContext" in r.text:
-                    # Keycloak 20+ React theme: no <form> in the HTML, the
-                    # client renders it from kcContext and POSTs to
-                    # url.loginAction. pageId says which form.
-                    pid = re.search(r'"pageId"\s*:\s*"([^"]+)"', r.text)
-                    pid = (pid.group(1) if pid else "").lower()
-                    if "otp" in pid:
-                        return ("otp", r.text, url)
-                    return ("form", r.text, url)
             raise RuntimeError("unexpected HTTP %d at %s" % (r.status_code, url[:120]))
         raise RuntimeError("too many redirects in login flow")
 
@@ -336,9 +344,9 @@ class VolvoClient:
 
     @staticmethod
     def _kc_error(html):
-        m = re.search(r'"type"\s*:\s*"error"[^}]*"message"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"', html)
+        m = re.search(r'"type"\s*:\s*"error"[^}]*"(?:message|summary)"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"', html)
         if not m:
-            m = re.search(r'"message"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"[^}]*"type"\s*:\s*"error"', html)
+            m = re.search(r'"(?:message|summary)"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"[^}]*"(?:type"\s*:\s*"error"|error"\s*:\s*true)', html)
         if not m:
             m = re.search(r'kc-feedback-text[^>]*>\s*([^<]+)', html)
         if not m:
@@ -439,9 +447,9 @@ class VolvoClient:
             raise RuntimeError("OTP form no longer present — start a new login")
         fields["otp"] = code.strip()
         r = s.post(action, data=fields, timeout=30, allow_redirects=False)
-        loc = r.headers.get("location")
-        kind, payload, _ = self._follow(
-            s, urllib.parse.urljoin(action, loc) if loc else action)
+        cls = self._classify(r, action)
+        kind, payload, _ = cls if cls else self._follow(
+            s, urllib.parse.urljoin(action, r.headers.get("location") or action))
         if kind != "code":
             raise RuntimeError("OTP not accepted: %s"
                                % (self._kc_error(payload or "") or "unexpected page"))
