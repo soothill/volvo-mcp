@@ -288,13 +288,17 @@ class VolvoClient:
                                        % (self._kc_error(payload2) or "unknown error"))
                 if kind2 == "otp":
                     self._pending["headless"] = {"cookies": s.cookies.get_dict(),
-                                                 "url": page_url2}
+                                                 "url": page_url2,
+                                                 "action": self._kc_login_action(payload2),
+                                                 "fields": self._kc_hidden_inputs(payload2)}
                     self._save_pending()
                     return self._otp_gate()
                 raise RuntimeError("unexpected state after credentials")
             if kind == "otp":
                 self._pending["headless"] = {"cookies": s.cookies.get_dict(),
-                                             "url": page_url}
+                                             "url": page_url,
+                                             "action": self._kc_login_action(payload),
+                                             "fields": self._kc_hidden_inputs(payload)}
                 self._save_pending()
                 return self._otp_gate()
             raise RuntimeError("unexpected page: %s" % kind)
@@ -575,18 +579,21 @@ class VolvoClient:
         s = requests.Session()
         s.headers.update({"user-agent": self.BROWSER_UA})
         s.cookies.update(head["cookies"])
-        r = s.get(head["url"], timeout=30, allow_redirects=False)
-        action, fields = self._form_fields(r.text, "kc-otp-login-form")
-        if action is None:
-            action, fields = self._form_fields(r.text, "kc-form-login")
-        if action is None:
-            action, fields = self._kc_login_action(r.text), {}
-            if action:
-                # React theme: the OTP form's hidden inputs (notably
-                # otp_credential_id — without it Keycloak does not know which
-                # credential to verify and bounces the POST) exist only in
-                # kcContext; the browser JS renders them into the form.
-                fields = self._kc_hidden_inputs(r.text)
+        # Re-GETting the OTP page EXPIRES the Keycloak auth flow (pageId
+        # login-page-expired) — the code then bounces no matter how correct it
+        # is. Use the loginAction + hidden fields captured at login_start.
+        action = head.get("action")
+        if action:
+            fields = dict(head.get("fields") or {})
+        else:
+            r = s.get(head["url"], timeout=30, allow_redirects=False)
+            action, fields = self._form_fields(r.text, "kc-otp-login-form")
+            if action is None:
+                action, fields = self._form_fields(r.text, "kc-form-login")
+            if action is None:
+                action, fields = self._kc_login_action(r.text), {}
+                if action:
+                    fields = self._kc_hidden_inputs(r.text)
         if action is None:
             raise RuntimeError("OTP form no longer present — start a new login")
         fields["otp"] = code.strip()
