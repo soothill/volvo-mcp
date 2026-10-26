@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
 import urllib.parse
@@ -203,18 +204,20 @@ class VolvoClient:
         return out
 
     def login_start(self):
-        """Begin a browser login and return the URL for the user to open.
+        """Begin a Volvo ID login.
 
         Volvo retired the scriptable pi.flow JSON endpoint for the current
-        app client: mo2qy9h_10 answers "OAuth client is not allowed to
-        initiate authentication API flow via the pi.flow response mode", so
-        login is now the standard redirect flow. The user opens auth_url,
-        signs in with their Volvo ID (the OTP step happens in the browser),
-        and the browser finally lands on the app's custom-scheme redirect —
-        which looks broken on a desktop because no app is registered for
-        vca://. That is fine: the address-bar URL carries the authorisation
-        code, and volvo_auth_finish exchanges it with the PKCE verifier held
-        here. No username/password is stored or needed any more.
+        app client (mo2qy9h_10 refuses response_mode=pi.flow), so login is now
+        the standard redirect flow ending on the app's vca:// custom scheme.
+
+        Two paths, chosen automatically:
+        - HEADLESS (preferred): if VOLVO_USERNAME/VOLVO_PASSWORD are configured,
+          drive the Keycloak login form over plain HTTP with a cookie jar. The
+          password POST is scripted; only the OTP needs the user (Volvo sends
+          it to the Volvo app/email — pass it to volvo_auth_otp).
+        - BROWSER fallback: return auth_url for the user to open; the browser
+          lands on a vca:// URL that "fails to open" (no app registered) and
+          the pasted-back URL goes to volvo_auth_finish.
         """
         verifier = secrets.token_urlsafe(48)
         challenge = base64.urlsafe_b64encode(
@@ -230,7 +233,8 @@ class VolvoClient:
                + "&state=" + state)
         self._pending = {"verifier": verifier, "state": state}
         self._save_pending()
-        return {
+
+        browser = {
             "result": "browser_login_required",
             "auth_url": url,
             "instructions": (
@@ -239,21 +243,130 @@ class VolvoClient:
                 "on a vca:// URL that fails to open — expected. Copy the FULL "
                 "final address-bar URL and call volvo_auth_finish with it."),
         }
+        if not (self.username and self.password):
+            return browser
+
+        # ---- headless attempt ----
+        try:
+            s = requests.Session()
+            s.headers.update({"user-agent": self.BROWSER_UA})
+            kind, payload, page_url = self._follow(s, url)
+            if kind == "code":
+                return self._exchange(payload)
+            if kind == "form":
+                action, fields = self._form_fields(payload, "kc-form-login")
+                if action is None:
+                    raise RuntimeError("could not parse kc-form-login")
+                fields.update({"username": self.username, "password": self.password})
+                r = s.post(action, data=fields, timeout=30, allow_redirects=False)
+                nxt = r.headers.get("location")
+                kind2, payload2, page_url2 = self._follow(
+                    s, urllib.parse.urljoin(action, nxt) if nxt else action)
+                if kind2 == "code":
+                    return self._exchange(payload2)
+                if kind2 == "form":
+                    # Keycloak re-renders the login page with an error on bad creds.
+                    msg = re.search(r'kc-feedback-text[^>]*>\s*([^<]+)', payload2)
+                    raise RuntimeError("credentials rejected: %s"
+                                       % (msg.group(1).strip() if msg else "unknown error"))
+                if kind2 == "otp":
+                    self._pending["headless"] = {"cookies": s.cookies.get_dict(),
+                                                 "url": page_url2}
+                    self._save_pending()
+                    return {"result": "otp_required",
+                            "hint": "A one-time code was sent to your Volvo "
+                                    "app/email. Call volvo_auth_otp with it."}
+                raise RuntimeError("unexpected state after credentials")
+            if kind == "otp":
+                self._pending["headless"] = {"cookies": s.cookies.get_dict(),
+                                             "url": page_url}
+                self._save_pending()
+                return {"result": "otp_required",
+                        "hint": "A one-time code was sent to your Volvo "
+                                "app/email. Call volvo_auth_otp with it."}
+            raise RuntimeError("unexpected page: %s" % kind)
+        except Exception as exc:  # noqa: BLE001 - headless is best-effort
+            # Never lose the browser path because the scripted one broke.
+            browser["headless_error"] = str(exc)[:200]
+            return browser
+
+    BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15")
+
+    def _follow(self, s, url):
+        """Walk the redirect chain without a browser.
+
+        Returns ('code', vca_url, None) when the flow completes, or
+        ('form'|'otp', response, url) when a Keycloak page needs input.
+        vca:// is never "followed" — the code is read from the Location.
+        """
+        for _ in range(10):
+            r = s.get(url, timeout=30, allow_redirects=False)
+            loc = r.headers.get("location", "")
+            if loc.startswith("vca://"):
+                return ("code", loc, None)
+            if r.status_code in (301, 302, 303, 307, 308) and loc:
+                url = urllib.parse.urljoin(url, loc)
+                continue
+            if r.status_code == 200:
+                if 'id="kc-form-login"' in r.text:
+                    return ("form", r.text, url)
+                if 'id="kc-otp-login-form"' in r.text or 'name="otp"' in r.text:
+                    return ("otp", r.text, url)
+            raise RuntimeError("unexpected HTTP %d at %s" % (r.status_code, url[:120]))
+        raise RuntimeError("too many redirects in login flow")
+
+    @staticmethod
+    def _form_fields(html, form_id):
+        """Extract a Keycloak form's action URL and hidden inputs."""
+        import html as htmllib
+        tag = None
+        for m in re.finditer(r"<form\b[^>]*>", html):
+            if 'id="%s"' % form_id in m.group(0):
+                tag = m
+                break
+        if tag is None:
+            return None, None
+        am = re.search(r'action="([^"]+)"', tag.group(0))
+        if not am:
+            return None, None
+        action = htmllib.unescape(am.group(1))
+        start = tag.end()
+        end = html.find("</form>", start)
+        body = html[start:end] if end > 0 else html[start:]
+        fields = {}
+        for hm in re.finditer(r'<input[^>]*>', body):
+            itag = hm.group(0)
+            if 'type="hidden"' not in itag:
+                continue
+            nm = re.search(r'name="([^"]+)"', itag)
+            vl = re.search(r'value="([^"]*)"', itag)
+            if nm:
+                fields[nm.group(1)] = htmllib.unescape(vl.group(1)) if vl else ""
+        return action, fields
 
     def login_finish(self, pasted):
         """Complete login with the redirect URL (or bare code) from the browser."""
         if not self._pending:
             raise RuntimeError("No login in progress. Call volvo_auth_start first.")
         pasted = pasted.strip()
-        code, state = pasted, None
         if "code=" in pasted:
-            qs = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
-            code = (qs.get("code") or [None])[0]
-            state = (qs.get("state") or [None])[0]
-            if state and state != self._pending["state"]:
-                raise RuntimeError("state mismatch — call volvo_auth_start again")
+            return self._exchange(pasted)
+        if self._pending.get("headless"):
+            raise RuntimeError("A headless login is in progress — give the OTP "
+                               "to volvo_auth_otp instead.")
+        # Bare code pasted directly.
+        return self._exchange("vca://x/?code=" + urllib.parse.quote(pasted, safe=""))
+
+    def _exchange(self, vca_url):
+        """Exchange the authorisation code from a vca:// redirect for tokens."""
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(vca_url).query)
+        code = (qs.get("code") or [None])[0]
+        state = (qs.get("state") or [None])[0]
         if not code:
-            raise RuntimeError("No authorisation code found. Paste the full redirected URL.")
+            raise RuntimeError("No authorisation code found in the redirect.")
+        if state and state != self._pending["state"]:
+            raise RuntimeError("state mismatch — call volvo_auth_start again")
         body = {"grant_type": "authorization_code", "code": code,
                 "redirect_uri": REDIRECT_URI, "code_verifier": self._pending["verifier"]}
         headers = {"content-type": "application/x-www-form-urlencoded", "user-agent": UA}
@@ -269,11 +382,37 @@ class VolvoClient:
         self._save_token(r.json())
         return {"result": "authenticated", "expires_at": self.expires_at.isoformat()}
 
-    # Backwards-compatible alias: the OTP is now entered in the browser and the
-    # thing that comes back is a redirect URL. Accept either so old muscle
-    # memory (and the old tool name) keeps working.
     def login_otp(self, code):
-        return self.login_finish(code)
+        """Finish a headless login with the one-time code from the Volvo app/email.
+
+        With a browser login in progress this behaves as an alias of
+        volvo_auth_finish (accepts the pasted redirect URL), so old muscle
+        memory keeps working for both paths.
+        """
+        if not self._pending:
+            raise RuntimeError("No login in progress. Call volvo_auth_start first.")
+        head = self._pending.get("headless")
+        if not head:
+            return self.login_finish(code)
+        s = requests.Session()
+        s.headers.update({"user-agent": self.BROWSER_UA})
+        s.cookies.update(head["cookies"])
+        r = s.get(head["url"], timeout=30, allow_redirects=False)
+        action, fields = self._form_fields(r.text, "kc-otp-login-form")
+        if action is None:
+            action, fields = self._form_fields(r.text, "kc-form-login")
+        if action is None:
+            raise RuntimeError("OTP form no longer present — start a new login")
+        fields["otp"] = code.strip()
+        r = s.post(action, data=fields, timeout=30, allow_redirects=False)
+        loc = r.headers.get("location")
+        kind, payload, _ = self._follow(
+            s, urllib.parse.urljoin(action, loc) if loc else action)
+        if kind != "code":
+            msg = re.search(r'kc-feedback-text[^>]*>\s*([^<]+)', payload or "")
+            raise RuntimeError("OTP not accepted: %s"
+                               % (msg.group(1).strip() if msg else "unexpected page"))
+        return self._exchange(payload)
 
     def _pending_path(self):
         return self.token_path + ".pending.json"
