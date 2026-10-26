@@ -10,7 +10,10 @@
 set -euo pipefail
 
 SECR=/etc/volvo-mcp/secrets
-RUNUID=10001
+# The image's appuser is uid 1000 (plain `useradd -m appuser` in the Dockerfile).
+# Not 10001 — that is the evohome containers' uid; using it here means the
+# container cannot read its own secrets (found the hard way, 26 Oct).
+RUNUID=1000
 [ "$(id -u)" = 0 ] || { echo "run as root (pct exec 140)" >&2; exit 1; }
 
 mkdir -p "$SECR" && chmod 700 "$SECR"
