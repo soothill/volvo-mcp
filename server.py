@@ -44,6 +44,14 @@ UNLOCK_CMD = DETAILS + "/commands/unlock"
 
 KM_TO_MI = 0.621371
 
+# A failed token refresh counts against Volvo's "too many failed logins" client
+# lockout. volvo_status makes ~7 API calls per poll and each one used to attempt
+# its own refresh, so one expired token turned into ~420 failed OAuth POSTs per
+# hour at a 60s poll interval — which is what gets the client locked. Refreshes
+# are now single-flight and back off exponentially after failing.
+REFRESH_BACKOFF_BASE_S = 300
+REFRESH_BACKOFF_MAX_S = 3600
+
 
 def _env(name, default=None):
     return os.environ.get(name, default)
@@ -96,6 +104,10 @@ class VolvoClient:
         self._vin = None
         self._pending = None  # {"session":..., "data":...} during OTP login
         self._lock = __import__("threading").Lock()
+        # Refresh failure state, so a broken token cannot turn into a login storm.
+        self._refresh_failed_at = None
+        self._refresh_attempts = 0
+        self._refresh_error = None
         self.session = requests.Session()
         self._load_token()
 
@@ -139,8 +151,37 @@ class VolvoClient:
             if not self.vcc_key:
                 need.append("VOLVO_VCC_API_KEY")
             return {"authenticated": False, "missing": need}
-        return {"authenticated": True, "token_expires_at": self.expires_at.isoformat(),
-                "vin": self.vin()}
+
+        expired = datetime.now(timezone.utc) >= self.expires_at
+        try:
+            vin = self.vin()
+        except Exception as exc:  # noqa: BLE001 - status must never itself raise
+            vin = None
+            out_vin_error = str(exc)[:200]
+        else:
+            out_vin_error = None
+        out = {
+            # "authenticated" used to mean "we have a token on file", which stayed
+            # true for hours after it expired and misled callers into thinking
+            # data was simply unavailable.
+            "authenticated": not expired,
+            "token_expires_at": self.expires_at.isoformat(),
+            "token_expired": expired,
+            "vin": vin,
+        }
+        if out_vin_error:
+            out["vin_error"] = out_vin_error
+        if self._refresh_attempts:
+            out["refresh_attempts"] = self._refresh_attempts
+            out["refresh_error"] = self._refresh_error
+            out["refresh_retry_in_s"] = max(
+                0, int(self._refresh_backoff_s()
+                       - (datetime.now(timezone.utc) - self._refresh_failed_at).total_seconds()))
+        if expired:
+            out["action_required"] = (
+                "token expired and refresh is not recovering it — run volvo_auth_start "
+                "then volvo_auth_otp with the code sent to your Volvo app/email")
+        return out
 
     def login_start(self):
         if not self.username or not self.password:
@@ -210,22 +251,66 @@ class VolvoClient:
         self._save_token(r.json())
 
     def refresh(self):
+        """Refresh the access token, single-flight and with exponential backoff.
+
+        Callers used to each trigger their own refresh; with ~7 API calls per
+        status poll that became a login storm against Volvo's OAuth endpoint and
+        tripped the client lockout. Now only one thread refreshes, failures are
+        remembered, and further attempts are suppressed until the backoff expires.
+        """
         if not self.refresh_token:
             raise RuntimeError("Not authenticated. Use volvo_auth_start/volvo_auth_otp.")
-        r = requests.post(OAUTH_TOKEN_URL,
-                          data={"grant_type": "refresh_token", "refresh_token": self.refresh_token},
-                          headers={"authorization": "Basic " + CLIENT_BASIC,
-                                   "Content-Type": "application/x-www-form-urlencoded"},
-                          timeout=20)
-        if r.status_code != 200:
-            raise RuntimeError("refresh failed: %s" % r.text)
-        self._save_token(r.json())
+
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            # Another caller may have refreshed successfully while we queued here.
+            if self.expires_at and now < self.expires_at:
+                return
+            if self._refresh_failed_at is not None:
+                elapsed = (now - self._refresh_failed_at).total_seconds()
+                if elapsed < self._refresh_backoff_s():
+                    raise RuntimeError(
+                        "token refresh suppressed for %ds after earlier failure (Volvo "
+                        "rate/lockout protection): %s"
+                        % (int(self._refresh_backoff_s() - elapsed), self._refresh_error)
+                    )
+            try:
+                r = requests.post(OAUTH_TOKEN_URL,
+                                  data={"grant_type": "refresh_token",
+                                        "refresh_token": self.refresh_token},
+                                  headers={"authorization": "Basic " + CLIENT_BASIC,
+                                           "Content-Type": "application/x-www-form-urlencoded"},
+                                  timeout=20)
+                if r.status_code != 200:
+                    raise RuntimeError("refresh failed: %s" % r.text[:300])
+                self._save_token(r.json())
+                # Success clears the failure state completely.
+                self._refresh_failed_at = None
+                self._refresh_attempts = 0
+                self._refresh_error = None
+            except Exception as exc:  # noqa: BLE001 - must record any failure
+                self._refresh_failed_at = datetime.now(timezone.utc)
+                self._refresh_attempts += 1
+                self._refresh_error = str(exc)[:300]
+                raise
+
+    def _refresh_backoff_s(self):
+        if not self._refresh_attempts:
+            return 0
+        return min(REFRESH_BACKOFF_BASE_S * (2 ** (self._refresh_attempts - 1)),
+                   REFRESH_BACKOFF_MAX_S)
 
     def ensure_auth(self):
         if not self.access_token:
             raise RuntimeError("Not authenticated. Use volvo_auth_start/volvo_auth_otp.")
         if datetime.now(timezone.utc) >= self.expires_at:
             self.refresh()
+            # A token that is still expired after a refresh attempt means the
+            # refresh token is dead and only an interactive login will help.
+            if datetime.now(timezone.utc) >= self.expires_at:
+                raise RuntimeError(
+                    "session expired and refresh did not recover it — run "
+                    "volvo_auth_start + volvo_auth_otp to re-authenticate")
 
     # ---------- API ----------
     def vin(self):
