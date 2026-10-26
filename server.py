@@ -355,6 +355,19 @@ class VolvoClient:
         return json.loads('"' + m.group(1) + '"')  # unescape JS string escapes
 
     @staticmethod
+    def _kc_hidden_inputs(html):
+        """hiddenInputs from kcContext (React theme renders the form client-side)."""
+        m = re.search(r'"hiddenInputs"\s*:\s*(\[.*?\])', html, re.S)
+        if not m:
+            return {}
+        try:
+            items = json.loads(m.group(1))
+        except ValueError:
+            return {}
+        return {i["key"]: i["value"] for i in items
+                if isinstance(i, dict) and "key" in i and "value" in i}
+
+    @staticmethod
     def _kc_error(html):
         m = re.search(r'"type"\s*:\s*"error"[^}]*"(?:message|summary)"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"', html)
         if not m:
@@ -568,6 +581,12 @@ class VolvoClient:
             action, fields = self._form_fields(r.text, "kc-form-login")
         if action is None:
             action, fields = self._kc_login_action(r.text), {}
+            if action:
+                # React theme: the OTP form's hidden inputs (notably
+                # otp_credential_id — without it Keycloak does not know which
+                # credential to verify and bounces the POST) exist only in
+                # kcContext; the browser JS renders them into the form.
+                fields = self._kc_hidden_inputs(r.text)
         if action is None:
             raise RuntimeError("OTP form no longer present — start a new login")
         fields["otp"] = code.strip()
@@ -576,8 +595,10 @@ class VolvoClient:
         kind, payload, _ = cls if cls else self._follow(
             s, urllib.parse.urljoin(action, r.headers.get("location") or action))
         if kind != "code":
-            raise RuntimeError("OTP not accepted: %s"
-                               % (self._kc_error(payload or "") or "unexpected page"))
+            pid = re.search(r'"pageId"\s*:\s*"([^"]+)"', payload or "")
+            raise RuntimeError("OTP not accepted: %s (pageId=%s)"
+                               % (self._kc_error(payload or "") or "unexpected page",
+                                  pid.group(1) if pid else "?"))
         return self._exchange(payload)
 
     def _pending_path(self):
