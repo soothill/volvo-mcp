@@ -195,7 +195,12 @@ class VolvoClient:
         params = ("?client_id=" + CLIENT_ID + "&response_type=code"
                   "&acr_values=urn:volvoid:aal:bronze:2sv&response_mode=pi.flow&scope=" + SCOPE)
         r = s.get(OAUTH_AUTH_URL + params, timeout=20)
-        r.raise_for_status()
+        if r.status_code != 200:
+            # raise_for_status() discarded the body, and the body is the only
+            # place PingFederate explains itself (e.g. "Unknown or invalid
+            # client_id" while Volvo has the client locked after a refresh
+            # storm — the status line alone sent us hunting for a bad secret).
+            raise RuntimeError("auth start failed: HTTP %d %s" % (r.status_code, r.text[:300]))
         data = r.json()
         status = data.get("status")
         if status == "COMPLETED":
@@ -394,12 +399,21 @@ async def volvo_auth_status():
 
 @mcp.tool(description="Start Volvo ID login (username/password from env). Usually returns otp_required.")
 async def volvo_auth_start():
-    return _j(await anyio.to_thread.run_sync(client.login_start))
+    try:
+        return _j(await anyio.to_thread.run_sync(client.login_start))
+    except Exception as exc:  # noqa: BLE001
+        # The framework replaces exception text with a generic "Error executing
+        # tool" for the MCP caller, so Volvo's actual explanation (lockout,
+        # bad password, ...) never reached the operator. Return it in band.
+        return _j({"result": "error", "error": str(exc)[:300]})
 
 
 @mcp.tool(description="Submit the one-time code from the Volvo app/email to finish login.")
 async def volvo_auth_otp(code: str):
-    return _j(await anyio.to_thread.run_sync(lambda: client.login_otp(code)))
+    try:
+        return _j(await anyio.to_thread.run_sync(lambda: client.login_otp(code)))
+    except Exception as exc:  # noqa: BLE001
+        return _j({"result": "error", "error": str(exc)[:300]})
 
 
 @mcp.tool(description="Full vehicle status: battery, range, charging, locks, windows, climate, odometer, tyres, location.")
