@@ -405,7 +405,14 @@ async def volvo_auth_otp(code: str):
 @mcp.tool(description="Full vehicle status: battery, range, charging, locks, windows, climate, odometer, tyres, location.")
 async def volvo_status():
     def run():
-        vin = client.vin()
+        # vin() calls ensure_auth(), so a dead token raises here before any
+        # section is attempted. Letting that escape turns the whole tool into a
+        # generic "Error executing tool volvo_status" and throws away the reason,
+        # which is the one thing a wall display or health check needs.
+        try:
+            vin = client.vin()
+        except Exception as ex:  # noqa: BLE001
+            return {"vin": None, "vin_error": str(ex)[:300]}
         out = {"vin": vin}
         try:
             e = flatten(client.get(ENERGY.format(vin=vin)))
