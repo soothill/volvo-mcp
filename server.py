@@ -256,7 +256,9 @@ class VolvoClient:
             if kind == "form":
                 action, fields = self._form_fields(payload, "kc-form-login")
                 if action is None:
-                    raise RuntimeError("could not parse kc-form-login")
+                    action, fields = self._kc_login_action(payload), {}
+                if action is None:
+                    raise RuntimeError("could not parse login form")
                 fields.update({"username": self.username, "password": self.password})
                 r = s.post(action, data=fields, timeout=30, allow_redirects=False)
                 nxt = r.headers.get("location")
@@ -266,9 +268,8 @@ class VolvoClient:
                     return self._exchange(payload2)
                 if kind2 == "form":
                     # Keycloak re-renders the login page with an error on bad creds.
-                    msg = re.search(r'kc-feedback-text[^>]*>\s*([^<]+)', payload2)
                     raise RuntimeError("credentials rejected: %s"
-                                       % (msg.group(1).strip() if msg else "unknown error"))
+                                       % (self._kc_error(payload2) or "unknown error"))
                 if kind2 == "otp":
                     self._pending["headless"] = {"cookies": s.cookies.get_dict(),
                                                  "url": page_url2}
@@ -313,8 +314,39 @@ class VolvoClient:
                     return ("form", r.text, url)
                 if 'id="kc-otp-login-form"' in r.text or 'name="otp"' in r.text:
                     return ("otp", r.text, url)
+                if "const kcContext" in r.text:
+                    # Keycloak 20+ React theme: no <form> in the HTML, the
+                    # client renders it from kcContext and POSTs to
+                    # url.loginAction. pageId says which form.
+                    pid = re.search(r'"pageId"\s*:\s*"([^"]+)"', r.text)
+                    pid = (pid.group(1) if pid else "").lower()
+                    if "otp" in pid:
+                        return ("otp", r.text, url)
+                    return ("form", r.text, url)
             raise RuntimeError("unexpected HTTP %d at %s" % (r.status_code, url[:120]))
         raise RuntimeError("too many redirects in login flow")
+
+    @staticmethod
+    def _kc_login_action(html):
+        """url.loginAction from a React-theme kcContext page."""
+        m = re.search(r'"loginAction"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"', html)
+        if not m:
+            return None
+        return json.loads('"' + m.group(1) + '"')  # unescape JS string escapes
+
+    @staticmethod
+    def _kc_error(html):
+        m = re.search(r'"type"\s*:\s*"error"[^}]*"message"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"', html)
+        if not m:
+            m = re.search(r'"message"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"[^}]*"type"\s*:\s*"error"', html)
+        if not m:
+            m = re.search(r'kc-feedback-text[^>]*>\s*([^<]+)', html)
+        if not m:
+            return None
+        try:
+            return json.loads('"' + m.group(1) + '"').strip()
+        except ValueError:
+            return m.group(1).strip()
 
     @staticmethod
     def _form_fields(html, form_id):
@@ -402,6 +434,8 @@ class VolvoClient:
         if action is None:
             action, fields = self._form_fields(r.text, "kc-form-login")
         if action is None:
+            action, fields = self._kc_login_action(r.text), {}
+        if action is None:
             raise RuntimeError("OTP form no longer present — start a new login")
         fields["otp"] = code.strip()
         r = s.post(action, data=fields, timeout=30, allow_redirects=False)
@@ -409,9 +443,8 @@ class VolvoClient:
         kind, payload, _ = self._follow(
             s, urllib.parse.urljoin(action, loc) if loc else action)
         if kind != "code":
-            msg = re.search(r'kc-feedback-text[^>]*>\s*([^<]+)', payload or "")
             raise RuntimeError("OTP not accepted: %s"
-                               % (msg.group(1).strip() if msg else "unexpected page"))
+                               % (self._kc_error(payload or "") or "unexpected page"))
         return self._exchange(payload)
 
     def _pending_path(self):
