@@ -1,8 +1,11 @@
-"""Volvo EX30 MCP server — wraps the Volvo Cars connected-vehicle API (volvo2mqtt-style privacy auth)."""
+"""Volvo EX30 MCP server — wraps the Volvo Cars connected-vehicle API (public PKCE OAuth, browser login)."""
 import base64
+import hashlib
 import json
 import os
+import secrets
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 import anyio
@@ -11,7 +14,16 @@ from mcp.server.mcpserver import MCPServer
 
 OAUTH_TOKEN_URL = "https://volvoid.eu.volvocars.com/as/token.oauth2"
 OAUTH_AUTH_URL = "https://volvoid.eu.volvocars.com/as/authorization.oauth2"
-CLIENT_ID = "h4Yf0b"
+# h4Yf0b — the secret-bearing client extracted from the Volvo app and shared by
+# volvo2mqtt / evcc / Domoticz for years — was revoked Volvo-wide on 2026-10-26
+# (authorize answers "Unknown or invalid client_id" for everyone; Dielee/volvo2mqtt#337).
+# mo2qy9h_10 is the client inside the current Volvo Cars Android app
+# (se.volvo.vcc 7.4/7.5, AuthenticationConfig): a PUBLIC PKCE client with no
+# secret, registered redirect below, and it accepts the conve:/energy: scopes.
+# Volvo refuses response_mode=pi.flow for it, so login is a browser redirect.
+CLIENT_ID = os.environ.get("VOLVO_CLIENT_ID", "mo2qy9h_10")
+REDIRECT_URI = os.environ.get(
+    "VOLVO_REDIRECT_URI", "vca://www.volvocars.com/l/vca/oauth/callback")
 UA = "vca-android/3.12.0"
 SCOPE = ("openid email profile care_by_volvo:financial_information:invoice:read "
          "care_by_volvo:financial_information:payment_method care_by_volvo:subscription:read "
@@ -56,9 +68,12 @@ REFRESH_BACKOFF_MAX_S = 3600
 def _env(name, default=None):
     return os.environ.get(name, default)
 
-# Public app client secret embedded in Volvo's official mobile app (same value used by Dielee/volvo2mqtt)
-CLIENT_SECRET = _env("VOLVO_CLIENT_SECRET", "U8YkSbVl6xwsg5YQqZfrgVmIaDphOsy1PCaUsicQto3TR5kwaJse4AZdgfIfcLyw")
-CLIENT_BASIC = base64.b64encode((CLIENT_ID + ":" + CLIENT_SECRET).encode()).decode()
+# The current app client is PUBLIC (PKCE): no secret is embedded or required.
+# VOLVO_CLIENT_SECRET is still honoured if set (confidential-client compat),
+# but the revoked h4Yf0b default is deliberately gone.
+CLIENT_SECRET = _env("VOLVO_CLIENT_SECRET")
+CLIENT_BASIC = (base64.b64encode((CLIENT_ID + ":" + CLIENT_SECRET).encode()).decode()
+                if CLIENT_SECRET else None)
 
 
 def _secret(name, filename):
@@ -102,7 +117,14 @@ class VolvoClient:
         self.refresh_token = None
         self.expires_at = None
         self._vin = None
-        self._pending = None  # {"session":..., "data":...} during OTP login
+        self._pending = None  # {"verifier":..., "state":...} during browser login
+        # A login interrupted by a container restart can be resumed if the
+        # verifier survived on disk (the /data volume persists).
+        try:
+            with open(self.token_path + ".pending.json") as f:
+                self._pending = json.load(f)
+        except (OSError, ValueError):
+            pass
         self._lock = __import__("threading").Lock()
         # Refresh failure state, so a broken token cannot turn into a login storm.
         self._refresh_failed_at = None
@@ -144,10 +166,6 @@ class VolvoClient:
     def auth_status(self):
         if not self.access_token:
             need = []
-            if not self.username:
-                need.append("VOLVO_USERNAME")
-            if not self.password:
-                need.append("VOLVO_PASSWORD")
             if not self.vcc_key:
                 need.append("VOLVO_VCC_API_KEY")
             return {"authenticated": False, "missing": need}
@@ -179,81 +197,99 @@ class VolvoClient:
                        - (datetime.now(timezone.utc) - self._refresh_failed_at).total_seconds()))
         if expired:
             out["action_required"] = (
-                "token expired and refresh is not recovering it — run volvo_auth_start "
-                "then volvo_auth_otp with the code sent to your Volvo app/email")
+                "token expired and refresh is not recovering it — run volvo_auth_start, "
+                "open the returned auth_url in a browser, sign in with your Volvo ID, "
+                "then call volvo_auth_finish with the final vca:// URL from the address bar")
         return out
 
     def login_start(self):
-        if not self.username or not self.password:
-            raise RuntimeError("VOLVO_USERNAME / VOLVO_PASSWORD not configured")
-        s = requests.Session()
-        s.headers.update({
-            "authorization": "Basic " + CLIENT_BASIC,
-            "user-agent": UA,
-            "Content-Type": "application/json; charset=utf-8",
-        })
-        params = ("?client_id=" + CLIENT_ID + "&response_type=code"
-                  "&acr_values=urn:volvoid:aal:bronze:2sv&response_mode=pi.flow&scope=" + SCOPE)
-        r = s.get(OAUTH_AUTH_URL + params, timeout=20)
-        if r.status_code != 200:
-            # raise_for_status() discarded the body, and the body is the only
-            # place PingFederate explains itself (e.g. "Unknown or invalid
-            # client_id" while Volvo has the client locked after a refresh
-            # storm — the status line alone sent us hunting for a bad secret).
-            raise RuntimeError("auth start failed: HTTP %d %s" % (r.status_code, r.text[:300]))
-        data = r.json()
-        status = data.get("status")
-        if status == "COMPLETED":
-            self._finish_login(s, data)
-            return {"result": "authenticated"}
-        if status == "USERNAME_PASSWORD_REQUIRED":
-            s.headers.update({"x-xsrf-header": "PingFederate"})
-            data = self._post_flow(s, data, "checkUsernamePassword",
-                                   {"username": self.username, "password": self.password})
-            status = data.get("status")
-        if status in ("OTP_REQUIRED", "OTP_VERIFIED"):
-            if status == "OTP_REQUIRED":
-                self._pending = {"session": s, "data": data}
-                return {"result": "otp_required",
-                        "hint": "A one-time code was sent to your Volvo app/email. Call volvo_auth_otp with it."}
-            data = self._post_flow(s, data, "continueAuthentication", {})
-            status = data.get("status")
-        if status == "COMPLETED":
-            self._finish_login(s, data)
-            return {"result": "authenticated"}
-        raise RuntimeError("Unexpected auth state: %s" % status)
+        """Begin a browser login and return the URL for the user to open.
 
-    def login_otp(self, code):
+        Volvo retired the scriptable pi.flow JSON endpoint for the current
+        app client: mo2qy9h_10 answers "OAuth client is not allowed to
+        initiate authentication API flow via the pi.flow response mode", so
+        login is now the standard redirect flow. The user opens auth_url,
+        signs in with their Volvo ID (the OTP step happens in the browser),
+        and the browser finally lands on the app's custom-scheme redirect —
+        which looks broken on a desktop because no app is registered for
+        vca://. That is fine: the address-bar URL carries the authorisation
+        code, and volvo_auth_finish exchanges it with the PKCE verifier held
+        here. No username/password is stored or needed any more.
+        """
+        verifier = secrets.token_urlsafe(48)
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        state = secrets.token_urlsafe(16)
+        url = (OAUTH_AUTH_URL
+               + "?client_id=" + CLIENT_ID
+               + "&response_type=code"
+               + "&redirect_uri=" + urllib.parse.quote(REDIRECT_URI, safe="")
+               + "&scope=" + urllib.parse.quote(SCOPE)
+               + "&code_challenge=" + challenge
+               + "&code_challenge_method=S256"
+               + "&state=" + state)
+        self._pending = {"verifier": verifier, "state": state}
+        self._save_pending()
+        return {
+            "result": "browser_login_required",
+            "auth_url": url,
+            "instructions": (
+                "Open auth_url in any browser and sign in with your Volvo ID "
+                "(enter the OTP in the browser when asked). The browser ends "
+                "on a vca:// URL that fails to open — expected. Copy the FULL "
+                "final address-bar URL and call volvo_auth_finish with it."),
+        }
+
+    def login_finish(self, pasted):
+        """Complete login with the redirect URL (or bare code) from the browser."""
         if not self._pending:
             raise RuntimeError("No login in progress. Call volvo_auth_start first.")
-        s, data = self._pending["session"], self._pending["data"]
-        data = self._post_flow(s, data, "checkOtp", {"otp": code})
-        data = self._post_flow(s, data, "continueAuthentication", {})
+        pasted = pasted.strip()
+        code, state = pasted, None
+        if "code=" in pasted:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
+            code = (qs.get("code") or [None])[0]
+            state = (qs.get("state") or [None])[0]
+            if state and state != self._pending["state"]:
+                raise RuntimeError("state mismatch — call volvo_auth_start again")
+        if not code:
+            raise RuntimeError("No authorisation code found. Paste the full redirected URL.")
+        body = {"grant_type": "authorization_code", "code": code,
+                "redirect_uri": REDIRECT_URI, "code_verifier": self._pending["verifier"]}
+        headers = {"content-type": "application/x-www-form-urlencoded", "user-agent": UA}
+        if CLIENT_BASIC:
+            headers["authorization"] = "Basic " + CLIENT_BASIC
+        else:
+            body["client_id"] = CLIENT_ID
+        r = requests.post(OAUTH_TOKEN_URL, data=body, headers=headers, timeout=20)
+        if r.status_code != 200:
+            raise RuntimeError("token exchange failed: HTTP %d %s" % (r.status_code, r.text[:300]))
         self._pending = None
-        self._finish_login(s, data)
-        return {"result": "authenticated"}
-
-    @staticmethod
-    def _post_flow(s, data, action, body):
-        href = data["_links"][action]["href"].replace("http://", "https://") + "?action=" + action
-        r = s.post(href, data=json.dumps(body), timeout=20)
-        if r.status_code != 200:
-            try:
-                msg = r.json()
-            except ValueError:
-                msg = r.text
-            raise RuntimeError("%s failed: %s" % (action, msg))
-        return r.json()
-
-    def _finish_login(self, s, data):
-        code = data["authorizeResponse"]["code"]
-        s.headers.update({"content-type": "application/x-www-form-urlencoded"})
-        r = s.post(OAUTH_TOKEN_URL, data={"code": code, "grant_type": "authorization_code"},
-                   headers={"authorization": "Basic " + CLIENT_BASIC},
-                   timeout=20)
-        if r.status_code != 200:
-            raise RuntimeError("token exchange failed: %s" % r.text)
+        self._clear_pending()
         self._save_token(r.json())
+        return {"result": "authenticated", "expires_at": self.expires_at.isoformat()}
+
+    # Backwards-compatible alias: the OTP is now entered in the browser and the
+    # thing that comes back is a redirect URL. Accept either so old muscle
+    # memory (and the old tool name) keeps working.
+    def login_otp(self, code):
+        return self.login_finish(code)
+
+    def _pending_path(self):
+        return self.token_path + ".pending.json"
+
+    def _save_pending(self):
+        try:
+            with open(self._pending_path(), "w") as f:
+                json.dump(self._pending, f)
+        except OSError:
+            pass
+
+    def _clear_pending(self):
+        try:
+            os.remove(self._pending_path())
+        except OSError:
+            pass
 
     def refresh(self):
         """Refresh the access token, single-flight and with exponential backoff.
@@ -264,7 +300,7 @@ class VolvoClient:
         remembered, and further attempts are suppressed until the backoff expires.
         """
         if not self.refresh_token:
-            raise RuntimeError("Not authenticated. Use volvo_auth_start/volvo_auth_otp.")
+            raise RuntimeError("Not authenticated. Use volvo_auth_start/volvo_auth_finish.")
 
         with self._lock:
             now = datetime.now(timezone.utc)
@@ -280,12 +316,16 @@ class VolvoClient:
                         % (int(self._refresh_backoff_s() - elapsed), self._refresh_error)
                     )
             try:
-                r = requests.post(OAUTH_TOKEN_URL,
-                                  data={"grant_type": "refresh_token",
-                                        "refresh_token": self.refresh_token},
-                                  headers={"authorization": "Basic " + CLIENT_BASIC,
-                                           "Content-Type": "application/x-www-form-urlencoded"},
-                                  timeout=20)
+                body = {"grant_type": "refresh_token",
+                        "refresh_token": self.refresh_token}
+                headers = {"Content-Type": "application/x-www-form-urlencoded",
+                           "user-agent": UA}
+                if CLIENT_BASIC:
+                    headers["authorization"] = "Basic " + CLIENT_BASIC
+                else:
+                    # Public PKCE client: identifies itself in the body.
+                    body["client_id"] = CLIENT_ID
+                r = requests.post(OAUTH_TOKEN_URL, data=body, headers=headers, timeout=20)
                 if r.status_code != 200:
                     raise RuntimeError("refresh failed: %s" % r.text[:300])
                 self._save_token(r.json())
@@ -307,7 +347,7 @@ class VolvoClient:
 
     def ensure_auth(self):
         if not self.access_token:
-            raise RuntimeError("Not authenticated. Use volvo_auth_start/volvo_auth_otp.")
+            raise RuntimeError("Not authenticated. Use volvo_auth_start/volvo_auth_finish.")
         if datetime.now(timezone.utc) >= self.expires_at:
             self.refresh()
             # A token that is still expired after a refresh attempt means the
@@ -315,7 +355,7 @@ class VolvoClient:
             if datetime.now(timezone.utc) >= self.expires_at:
                 raise RuntimeError(
                     "session expired and refresh did not recover it — run "
-                    "volvo_auth_start + volvo_auth_otp to re-authenticate")
+                    "volvo_auth_start + volvo_auth_finish to re-authenticate")
 
     # ---------- API ----------
     def vin(self):
@@ -397,7 +437,7 @@ async def volvo_auth_status():
     return _j(client.auth_status())
 
 
-@mcp.tool(description="Start Volvo ID login (username/password from env). Usually returns otp_required.")
+@mcp.tool(description="Start Volvo ID login: returns auth_url to open in a browser (Volvo ID + OTP happen there).")
 async def volvo_auth_start():
     try:
         return _j(await anyio.to_thread.run_sync(client.login_start))
@@ -408,7 +448,15 @@ async def volvo_auth_start():
         return _j({"result": "error", "error": str(exc)[:300]})
 
 
-@mcp.tool(description="Submit the one-time code from the Volvo app/email to finish login.")
+@mcp.tool(description="Finish login: paste the FULL final vca:// URL (or bare code) from the browser address bar.")
+async def volvo_auth_finish(redirect_url: str):
+    try:
+        return _j(await anyio.to_thread.run_sync(lambda: client.login_finish(redirect_url)))
+    except Exception as exc:  # noqa: BLE001
+        return _j({"result": "error", "error": str(exc)[:300]})
+
+
+@mcp.tool(description="Deprecated alias of volvo_auth_finish (the OTP is now entered in the browser).")
 async def volvo_auth_otp(code: str):
     try:
         return _j(await anyio.to_thread.run_sync(lambda: client.login_otp(code)))
