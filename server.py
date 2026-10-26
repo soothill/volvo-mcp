@@ -1,6 +1,10 @@
 """Volvo EX30 MCP server — wraps the Volvo Cars connected-vehicle API (public PKCE OAuth, browser login)."""
 import base64
+import email
+import email.header
+import email.utils
 import hashlib
+import imaplib
 import json
 import os
 import re
@@ -114,6 +118,17 @@ class VolvoClient:
         self.password = _secret("VOLVO_PASSWORD", "password")
         self.vcc_key = _secret("VOLVO_VCC_API_KEY", "vccapikey")
         self.vin_override = _env("VOLVO_VIN")
+        # Optional: read the login OTP straight from the mailbox Volvo sends it
+        # to, so a headless re-login needs no human at all. iCloud uses
+        # imap.mail.me.com with an app-specific password. All three must be set.
+        self.otp_imap_host = _env("VOLVO_OTP_IMAP_HOST")
+        self.otp_imap_user = _secret("VOLVO_OTP_IMAP_USER", "otp_imap_user")
+        self.otp_imap_pass = _secret("VOLVO_OTP_IMAP_PASS", "otp_imap_pass")
+        self.otp_folder = _env("VOLVO_OTP_IMAP_FOLDER", "INBOX")
+        self.otp_sender = (_env("VOLVO_OTP_SENDER") or "volvocars.com").lower()
+        self.otp_keyword = (_env("VOLVO_OTP_KEYWORD") or "code").lower()
+        self.otp_regex = re.compile(_env("VOLVO_OTP_REGEX") or r"(?<!\d)(\d{6})(?!\d)")
+        self.otp_wait_s = int(_env("VOLVO_OTP_WAIT_S", "90"))
         self.access_token = None
         self.refresh_token = None
         self.expires_at = None
@@ -231,7 +246,8 @@ class VolvoClient:
                + "&code_challenge=" + challenge
                + "&code_challenge_method=S256"
                + "&state=" + state)
-        self._pending = {"verifier": verifier, "state": state}
+        self._pending = {"verifier": verifier, "state": state,
+                         "started_at": time.time()}
         self._save_pending()
 
         browser = {
@@ -274,17 +290,13 @@ class VolvoClient:
                     self._pending["headless"] = {"cookies": s.cookies.get_dict(),
                                                  "url": page_url2}
                     self._save_pending()
-                    return {"result": "otp_required",
-                            "hint": "A one-time code was sent to your Volvo "
-                                    "app/email. Call volvo_auth_otp with it."}
+                    return self._otp_gate()
                 raise RuntimeError("unexpected state after credentials")
             if kind == "otp":
                 self._pending["headless"] = {"cookies": s.cookies.get_dict(),
                                              "url": page_url}
                 self._save_pending()
-                return {"result": "otp_required",
-                        "hint": "A one-time code was sent to your Volvo "
-                                "app/email. Call volvo_auth_otp with it."}
+                return self._otp_gate()
             raise RuntimeError("unexpected page: %s" % kind)
         except Exception as exc:  # noqa: BLE001 - headless is best-effort
             # Never lose the browser path because the scripted one broke.
@@ -421,6 +433,119 @@ class VolvoClient:
         self._clear_pending()
         self._save_token(r.json())
         return {"result": "authenticated", "expires_at": self.expires_at.isoformat()}
+
+    def _otp_gate(self):
+        """Keycloak is waiting for an OTP. If a mailbox is configured, fetch
+        the code from the email Volvo just sent and finish the login
+        unattended; otherwise fall back to asking a human."""
+        auto = self._auto_otp()
+        if auto is not None:
+            return auto
+        return {"result": "otp_required",
+                "hint": "A one-time code was sent to your Volvo "
+                        "app/email. Call volvo_auth_otp with it."}
+
+    def _auto_otp(self):
+        """Return the login result if the OTP came by email, else None."""
+        if not (self.otp_imap_host and self.otp_imap_user and self.otp_imap_pass):
+            return None
+        since = (self._pending or {}).get("started_at", time.time()) - 60
+        try:
+            code = self._otp_from_email(since)
+        except Exception:  # noqa: BLE001 - mailbox trouble must not kill the login
+            return None
+        if not code:
+            return None
+        try:
+            out = self.login_otp(code)
+        except Exception as exc:  # noqa: BLE001 - wrong code: let the human retry
+            return {"result": "otp_required",
+                    "hint": "IMAP found a code but Volvo rejected it (%s). "
+                            "Call volvo_auth_otp with the fresh code." % str(exc)[:120]}
+        out = dict(out)
+        out["otp_source"] = "email"
+        return out
+
+    def _mail_candidates(self, limit=8):
+        """Newest-first [(msg_bytes, from_l, date_epoch)] matching the sender filter."""
+        out = []
+        with imaplib.IMAP4_SSL(self.otp_imap_host, 993, timeout=30) as M:
+            M.login(self.otp_imap_user, self.otp_imap_pass)
+            M.select(self.otp_folder, readonly=True)
+            since = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
+            typ, data = M.search(None, "SINCE", since)
+            if typ != "OK":
+                raise RuntimeError("IMAP search failed: %s" % typ)
+            ids = (data[0].split() if data and data[0] else [])[-limit:][::-1]
+            for num in ids:
+                typ, raw = M.fetch(num, "(BODY.PEEK[])")
+                if typ != "OK" or not raw or not isinstance(raw[0], tuple):
+                    continue
+                msg = email.message_from_bytes(raw[0][1])
+                frm = str(email.header.make_header(
+                    email.header.decode_header(msg.get("From", "")) or []))
+                if self.otp_sender not in frm.lower():
+                    continue
+                try:
+                    date_ep = email.utils.mktime_tz(
+                        email.utils.parsedate_tz(msg.get("Date", "")))
+                except (TypeError, ValueError):
+                    date_ep = 0
+                out.append((msg, frm, date_ep))
+        return out
+
+    @staticmethod
+    def _mail_text(msg):
+        parts = []
+        for p in msg.walk():
+            if p.get_content_type() in ("text/plain", "text/html"):
+                try:
+                    raw = p.get_payload(decode=True)  # bytes, works on legacy Message
+                    if raw:
+                        parts.append(raw.decode(p.get_content_charset() or "utf-8",
+                                                errors="replace"))
+                except Exception:  # noqa: BLE001
+                    pass
+        text = "\n".join(parts)
+        return re.sub(r"<[^>]+>", " ", text)  # crude HTML strip; codes are plain text
+
+    def _otp_from_email(self, since_epoch):
+        """Poll the mailbox until a Volvo OTP newer than since_epoch appears."""
+        deadline = time.time() + self.otp_wait_s
+        while True:
+            try:
+                for msg, _frm, date_ep in self._mail_candidates():
+                    if date_ep and date_ep < since_epoch:
+                        continue
+                    subj = str(email.header.make_header(
+                        email.header.decode_header(msg.get("Subject", "")) or []))
+                    body = self._mail_text(msg)
+                    if self.otp_keyword not in (subj + " " + body).lower():
+                        continue
+                    m = self.otp_regex.search(body) or self.otp_regex.search(subj)
+                    if m:
+                        return m.group(1)
+            except Exception:  # noqa: BLE001 - transient IMAP/network blips
+                pass
+            if time.time() >= deadline:
+                return None
+            time.sleep(5)
+
+    def mail_probe(self, limit=5):
+        """Diagnostic: recent Volvo-ish mail (senders/subjects only, never codes)."""
+        if not (self.otp_imap_host and self.otp_imap_user and self.otp_imap_pass):
+            return {"configured": False,
+                    "hint": "set VOLVO_OTP_IMAP_HOST / VOLVO_OTP_IMAP_USER / "
+                            "VOLVO_OTP_IMAP_PASS (secret file otp_imap_pass)"}
+        try:
+            cands = self._mail_candidates(limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            return {"configured": True, "error": str(exc)[:300]}
+        return {"configured": True, "host": self.otp_imap_host,
+                "matches": [{"from": f, "subject": str(email.header.make_header(
+                    email.header.decode_header(m.get("Subject", "")) or [])),
+                    "date": email.utils.formatdate(d, usegmt=True)}
+                    for m, f, d in cands]}
 
     def login_otp(self, code):
         """Finish a headless login with the one-time code from the Volvo app/email.
@@ -617,7 +742,7 @@ async def volvo_auth_status():
     return _j(client.auth_status())
 
 
-@mcp.tool(description="Start Volvo ID login: returns auth_url to open in a browser (Volvo ID + OTP happen there).")
+@mcp.tool(description="Start Volvo ID login. Headless when VOLVO_USERNAME/PASSWORD are set; the OTP is then auto-read from the mailbox if VOLVO_OTP_IMAP_* is configured, else volvo_auth_otp takes the code. Without credentials it returns an auth_url for browser login.")
 async def volvo_auth_start():
     try:
         return _j(await anyio.to_thread.run_sync(client.login_start))
@@ -642,6 +767,11 @@ async def volvo_auth_otp(code: str):
         return _j(await anyio.to_thread.run_sync(lambda: client.login_otp(code)))
     except Exception as exc:  # noqa: BLE001
         return _j({"result": "error", "error": str(exc)[:300]})
+
+
+@mcp.tool(description="Diagnostic: verify mailbox access for OTP auto-read. Lists recent matching mail (senders/subjects only, never codes).")
+async def volvo_mail_probe(limit: int = 5):
+    return _j(await anyio.to_thread.run_sync(lambda: client.mail_probe(limit)))
 
 
 @mcp.tool(description="Full vehicle status: battery, range, charging, locks, windows, climate, odometer, tyres, location.")
