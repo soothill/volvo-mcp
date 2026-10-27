@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -68,6 +69,15 @@ KM_TO_MI = 0.621371
 # are now single-flight and back off exponentially after failing.
 REFRESH_BACKOFF_BASE_S = 300
 REFRESH_BACKOFF_MAX_S = 3600
+
+# Self-healing watchdog. A daemon thread keeps the access token warm (so the
+# refresh chain never dies of disuse when no consumer is polling) and, when the
+# chain IS dead, runs the unattended headless login (password scripted + OTP
+# read from the mailbox). Failed logins count against Volvo's lockout just
+# like failed refreshes, so re-login backs off far harder: 15 min -> 6 h.
+WATCHDOG_INTERVAL_S = int(os.environ.get("VOLVO_WATCHDOG_INTERVAL_S", "900"))
+LOGIN_BACKOFF_BASE_S = 900
+LOGIN_BACKOFF_MAX_S = 6 * 3600
 
 
 def _env(name, default=None):
@@ -146,6 +156,12 @@ class VolvoClient:
         self._refresh_failed_at = None
         self._refresh_attempts = 0
         self._refresh_error = None
+        # Watchdog re-login failure state (separate backoff: a failed LOGIN is
+        # worse than a failed refresh — it counts against the lockout too).
+        self._login_failed_at = None
+        self._login_attempts = 0
+        self._login_error = None
+        self._healed_at = None
         self.session = requests.Session()
         self._load_token()
 
@@ -184,7 +200,8 @@ class VolvoClient:
             need = []
             if not self.vcc_key:
                 need.append("VOLVO_VCC_API_KEY")
-            return {"authenticated": False, "missing": need}
+            return {"authenticated": False, "missing": need,
+                    "watchdog": self._watchdog_info()}
 
         expired = datetime.now(timezone.utc) >= self.expires_at
         try:
@@ -205,6 +222,7 @@ class VolvoClient:
         }
         if out_vin_error:
             out["vin_error"] = out_vin_error
+        out["watchdog"] = self._watchdog_info()
         if self._refresh_attempts:
             out["refresh_attempts"] = self._refresh_attempts
             out["refresh_error"] = self._refresh_error
@@ -690,6 +708,84 @@ class VolvoClient:
                     "session expired and refresh did not recover it — run "
                     "volvo_auth_start + volvo_auth_finish to re-authenticate")
 
+    # ---------- self-healing watchdog ----------
+    def _can_unattended(self):
+        return bool(self.username and self.password
+                    and self.otp_imap_host and self.otp_imap_user and self.otp_imap_pass)
+
+    def _login_backoff_s(self):
+        if not self._login_attempts:
+            return 0
+        return min(LOGIN_BACKOFF_BASE_S * (2 ** (self._login_attempts - 1)),
+                   LOGIN_BACKOFF_MAX_S)
+
+    def _watchdog_once(self):
+        """One healing pass: keep a live token warm; re-login when dead."""
+        now = datetime.now(timezone.utc)
+        if self.access_token and self.expires_at:
+            if now < self.expires_at - timedelta(minutes=10):
+                self._login_failed_at = None
+                self._login_attempts = 0
+                return "warm"
+            try:
+                self.refresh()
+                self._login_failed_at = None
+                self._login_attempts = 0
+                return "refreshed"
+            except Exception as exc:  # noqa: BLE001 - dead chain? decide below
+                dead = "invalid_grant" in str(exc) or "suppressed" in str(exc)
+                if not dead:
+                    return "refresh failed (transient): %s" % str(exc)[:120]
+        if not self._can_unattended():
+            return "token dead; unattended re-login not configured"
+        if self._pending:
+            # A human browser login gets 5 minutes of ownership before the
+            # watchdog takes over; a failed unattended attempt leaves pending
+            # state behind that must not wedge the loop forever.
+            if time.time() - self._pending.get("started_at", 0) < 300:
+                return "login already in progress"
+            self._pending = None
+            self._clear_pending()
+        if (self._login_failed_at is not None
+                and (now - self._login_failed_at).total_seconds() < self._login_backoff_s()):
+            return "re-login suppressed for %ds after earlier failure: %s" % (
+                int(self._login_backoff_s()
+                    - (now - self._login_failed_at).total_seconds()), self._login_error)
+        try:
+            out = self.login_start()
+            if out.get("result") != "authenticated":
+                raise RuntimeError(str(out.get("hint") or out.get("result"))[:200])
+            self._login_failed_at = None
+            self._login_attempts = 0
+            self._healed_at = now
+            return "re-logged in unattended (otp via %s)" % out.get("otp_source", "?")
+        except Exception as exc:  # noqa: BLE001 - must never crash the loop
+            self._login_failed_at = datetime.now(timezone.utc)
+            self._login_attempts += 1
+            self._login_error = str(exc)[:200]
+            return "re-login failed: %s" % self._login_error
+
+    def watchdog_loop(self):
+        while True:
+            try:
+                self._watchdog_last = self._watchdog_once()
+            except Exception as exc:  # noqa: BLE001 - the loop itself is immortal
+                self._watchdog_last = "watchdog error: %s" % str(exc)[:120]
+            time.sleep(WATCHDOG_INTERVAL_S)
+
+    def _watchdog_info(self):
+        info = {"unattended_relogin": self._can_unattended(),
+                "last_pass": getattr(self, "_watchdog_last", None)}
+        if self._login_attempts:
+            info["relogin_attempts"] = self._login_attempts
+            info["relogin_error"] = self._login_error
+            info["relogin_retry_in_s"] = max(0, int(
+                self._login_backoff_s()
+                - (datetime.now(timezone.utc) - self._login_failed_at).total_seconds()))
+        if self._healed_at:
+            info["healed_at"] = self._healed_at.isoformat()
+        return info
+
     # ---------- API ----------
     def vin(self):
         if self._vin:
@@ -922,4 +1018,5 @@ async def volvo_statistics():
 if __name__ == "__main__":
     host = _env("MCP_HOST", "0.0.0.0")
     port = int(_env("MCP_PORT", "8090"))
+    threading.Thread(target=client.watchdog_loop, daemon=True).start()
     mcp.run(transport="streamable-http", host=host, port=port)
